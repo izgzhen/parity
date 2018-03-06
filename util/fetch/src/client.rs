@@ -30,7 +30,7 @@ use futures::sync::{mpsc, oneshot};
 use parking_lot::{Condvar, Mutex};
 
 use hyper::{self, Request, Method, StatusCode, Uri};
-use hyper::header::{UserAgent, ContentType};
+use hyper::header::{UserAgent, Location, ContentType};
 use hyper::mime::Mime;
 
 use hyper_rustls;
@@ -86,15 +86,16 @@ pub trait Fetch: Clone + Send + Sync + 'static {
 
 const THREAD_NAME: &str = "fetch";
 const CLIENT_TIMEOUT_SECONDS: u64 = 5;
+const MAX_REDIRECTS: usize = 5;
 
-type TxResponse  = oneshot::Sender<Result<hyper::Response, hyper::error::Error>>;
-type RxResponse  = oneshot::Receiver<Result<hyper::Response, hyper::error::Error>>;
+type TxResponse  = oneshot::Sender<Result<hyper::Response, Error>>;
+type RxResponse  = oneshot::Receiver<Result<hyper::Response, Error>>;
 type StartupCond = Arc<(Mutex<Result<(), io::Error>>, Condvar)>;
 
 // `Proto`col values are sent over an mpsc channel from clients to
 // their shared background thread with a tokio core and hyper cient inside.
 enum Proto {
-	Request(hyper::Request, TxResponse),
+	Request(hyper::Request, TxResponse, usize),
 	Quit // terminates background thread
 }
 
@@ -120,7 +121,7 @@ impl Client {
 		let startup_done = Arc::new((Mutex::new(Ok(())), Condvar::new()));
 		let (tx_proto, rx_proto) = mpsc::channel(64);
 
-		Client::background_thread(startup_done.clone(), rx_proto)?;
+		Client::background_thread(startup_done.clone(), tx_proto.clone(), rx_proto)?;
 
 		let mut guard = startup_done.0.lock();
 		let startup_result = startup_done.1.wait_for(&mut guard, Duration::from_secs(3));
@@ -134,7 +135,6 @@ impl Client {
 			return Err(e.into())
 		}
 
-		// TODO: Add support for following redirects.
 		Ok(Client {
 			pool:     CpuPool::new(4),
 			tx_proto: tx_proto,
@@ -142,7 +142,10 @@ impl Client {
 		})
 	}
 
-	fn background_thread(start: StartupCond, rx_proto: mpsc::Receiver<Proto>) -> io::Result<thread::JoinHandle<()>> {
+	fn background_thread(start: StartupCond,
+                         tx_proto: mpsc::Sender<Proto>,
+                         rx_proto: mpsc::Receiver<Proto>) -> io::Result<thread::JoinHandle<()>>
+	{
 		thread::Builder::new().name(THREAD_NAME.into()).spawn(move || {
 			let mut core = match reactor::Core::new() {
 				Ok(c)  => c,
@@ -160,10 +163,10 @@ impl Client {
 			start.1.notify_one();
 			debug!(target: "fetch", "processing requests ...");
 
+			let maxdur = Duration::from_secs(CLIENT_TIMEOUT_SECONDS);
 			let work = rx_proto.take_while(|item| Ok(!item.is_quit())).for_each(|item| {
-				if let Proto::Request(rq, sender) = item {
+				if let Proto::Request(rq, sender, redir) = item {
 					trace!(target: "fetch", "new request");
-					let maxdur = Duration::from_secs(CLIENT_TIMEOUT_SECONDS);
 					let timeout = match reactor::Timeout::new(maxdur, &handle) {
 						Ok(t)  => t,
 						Err(e) => {
@@ -171,21 +174,38 @@ impl Client {
 							return future::err(())
 						}
 					};
-					let future = client.request(rq).select2(timeout).then(|rs| {
+					let reschedule = tx_proto.clone();
+					let future = client.request(rq).select2(timeout).then(move |rs| {
 						trace!(target: "fetch", "request finished");
 						// When sending responses back over the oneshot channels, we treat
 						// the possibility that the other end is gone as normal, hence we
 						// use `unwrap_or(())` and do not error.
 						match rs {
-							Ok(Either::A((r, _)))    => sender.send(Ok(r)).unwrap_or(()),
-							Ok(Either::B((_, _)))    => {
-								let err = io::Error::new(io::ErrorKind::TimedOut, "timeout");
-								sender.send(Err(hyper::Error::Io(err))).unwrap_or(())
+							Ok(Either::A((rs, _))) => {
+								if let Some(url) = redirect_location(&rs) {
+									if redir == 0 {
+										Either::A(future::ok(sender.send(Err(Error::TooManyRedirects)).unwrap_or(())))
+									} else {
+										Either::B(reschedule.send(Proto::Request(get(url), sender, redir - 1)).then(|result| {
+											if let Err(e) = result {
+												error!(target: "fetch", "failed to reschedule request: {}", e);
+											}
+											// We can not recover from this error. Client code will
+											// get a `oneshot::Canceled` error since we dropped the
+											// `oneshot::Sender`. This should not happen as long as
+											// this thread runs, as with `reschedule` we are
+											// sending the `Proto` value back to ourselves.
+											future::ok(())
+										}))
+									}
+								} else {
+									Either::A(future::ok(sender.send(Ok(rs)).unwrap_or(())))
+								}
 							}
-							Err(Either::A((err, _))) => sender.send(Err(err)).unwrap_or(()),
-							Err(Either::B((err, _))) => sender.send(Err(err.into())).unwrap_or(()),
+							Ok(Either::B((_, _)))    => Either::A(future::ok(sender.send(Err(Error::Timeout)).unwrap_or(()))),
+							Err(Either::A((err, _))) => Either::A(future::ok(sender.send(Err(err.into())).unwrap_or(()))),
+							Err(Either::B((err, _))) => Either::A(future::ok(sender.send(Err(err.into())).unwrap_or(()))),
 						}
-						future::ok(())
 					});
 					handle.spawn(future);
 					trace!(target: "fetch", "waiting for next request...")
@@ -235,27 +255,24 @@ impl Fetch for Client {
 			Err(e) => return Box::new(futures::future::err(e.into()))
 		};
 
-		let mut rq = Request::new(Method::Get, url.clone());
-		rq.headers_mut().set(UserAgent::new("Parity Fetch Neo"));
-
+		let req    = get(url.clone());
 		let sender = self.tx_proto.clone();
 		let limit  = self.limit.clone();
-		let pool   = self.pool.clone();
 		let future = self.pool.spawn_fn(move || {
 			let (tx_res, rx_res) = oneshot::channel();
-			sender.send(Proto::Request(rq, tx_res)).map(|_| rx_res)
+			sender.send(Proto::Request(req, tx_res, MAX_REDIRECTS)).map(|_| rx_res)
 		})
 		.map_err(|e| {
 			error!(target: "fetch", "failed to schedule request: {}", e);
 			Error::Other("failed to schedule request".into())
 		})
 		.and_then(move |rx_res| {
-			pool.spawn(FetchTask {
+			FetchTask {
 				url: url,
 				rx_res: rx_res,
 				limit: limit,
 				abort: abort
-			})
+			}
 		});
 		Box::new(future)
 	}
@@ -275,6 +292,25 @@ impl Fetch for Client {
 	{
 		self.pool.spawn(f).forget()
 	}
+}
+
+fn redirect_location(r: &hyper::Response) -> Option<Uri> {
+	use hyper::StatusCode::*;
+	match r.status() {
+		MovedPermanently | PermanentRedirect | TemporaryRedirect =>
+			if let Some(loc) = r.headers().get::<Location>() {
+				loc.parse().ok()
+			} else {
+				None
+			},
+		_ => None
+	}
+}
+
+fn get(u: Uri) -> hyper::Request {
+	let mut rq = Request::new(Method::Get, u);
+	rq.headers_mut().set(UserAgent::new("Parity Fetch Neo"));
+	rq
 }
 
 struct FetchTask {
@@ -320,6 +356,12 @@ pub enum Error {
 	Uri(hyper::error::UriError),
 	/// Request aborted
 	Aborted,
+	/// Followed too many redirects
+	TooManyRedirects,
+	/// Request took too long
+	Timeout,
+	/// The background request procesing was canceled
+	Canceled,
 	/// Some other error
 	Other(Box<error::Error + Send + Sync + 'static>)
 }
@@ -327,18 +369,21 @@ pub enum Error {
 impl fmt::Display for Error {
 	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
-			Error::Aborted      => write!(fmt, "The request has been aborted."),
-			Error::Hyper(ref e) => write!(fmt, "{}", e),
-			Error::Uri(ref e)   => write!(fmt, "{}", e),
-			Error::Io(ref e)    => write!(fmt, "{}", e),
-			Error::Other(ref e) => write!(fmt, "{}", e)
+			Error::Aborted          => write!(fmt, "The request has been aborted."),
+			Error::Hyper(ref e)     => write!(fmt, "{}", e),
+			Error::Uri(ref e)       => write!(fmt, "{}", e),
+			Error::Io(ref e)        => write!(fmt, "{}", e),
+			Error::Other(ref e)     => write!(fmt, "{}", e),
+			Error::TooManyRedirects => write!(fmt, "too many redirects"),
+			Error::Timeout          => write!(fmt, "request timed out"),
+			Error::Canceled         => write!(fmt, "background thread canceled request processing"),
 		}
 	}
 }
 
 impl From<oneshot::Canceled> for Error {
-	fn from(e: oneshot::Canceled) -> Self {
-		Error::Other(e.into())
+	fn from(_: oneshot::Canceled) -> Self {
+		Error::Canceled
 	}
 }
 
@@ -361,7 +406,7 @@ impl From<hyper::error::UriError> for Error {
 }
 
 enum ResponseInner {
-	Response(hyper::StatusCode, Option<ContentType>, BodyReader),
+	Response(StatusCode, Option<ContentType>, BodyReader),
 	Reader(Box<io::Read + Send>),
 	NotFound
 }
@@ -524,12 +569,12 @@ mod test {
 	#[test]
 	fn it_should_fetch() {
 		let fetch = Client::new().unwrap();
-		let future_resp1 = fetch.fetch("https://github.com");
+		let future_resp1 = fetch.fetch("https://wikipedia.org"); // redirects
 		let future_resp2 = fetch.fetch("https://github.com");
 		let mut resp1 = future_resp1.wait().unwrap();
 		let mut resp2 = future_resp2.wait().unwrap();
-		println!("{:?}", resp1.status());
-		println!("{:?}", resp2.status());
+		assert!(resp1.is_success());
+		assert!(resp2.is_success());
 		let mut s = String::new();
 		resp1.read_to_string(&mut s).unwrap();
 		println!("{} bytes", s.len());
