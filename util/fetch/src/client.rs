@@ -29,12 +29,13 @@ use futures_cpupool::CpuPool;
 use futures::sync::{mpsc, oneshot};
 use parking_lot::{Condvar, Mutex};
 
-use hyper::{self, Request, Method, StatusCode, Uri};
+use hyper::{self, Request, Method, StatusCode};
 use hyper::header::{UserAgent, Location, ContentType};
 use hyper::mime::Mime;
 
 use hyper_rustls;
 use tokio_core::reactor;
+use url::{self, Url};
 
 type BoxFuture<A, B> = Box<Future<Item = A, Error = B> + Send>;
 
@@ -95,7 +96,7 @@ type StartupCond = Arc<(Mutex<Result<(), io::Error>>, Condvar)>;
 // `Proto`col values are sent over an mpsc channel from clients to
 // their shared background thread with a tokio core and hyper cient inside.
 enum Proto {
-	Request(hyper::Request, TxResponse, usize),
+	Request(Url, hyper::Request, TxResponse, usize),
 	Quit // terminates background thread
 }
 
@@ -165,8 +166,8 @@ impl Client {
 
 			let maxdur = Duration::from_secs(CLIENT_TIMEOUT_SECONDS);
 			let work = rx_proto.take_while(|item| Ok(!item.is_quit())).for_each(|item| {
-				if let Proto::Request(rq, sender, redir) = item {
-					trace!(target: "fetch", "new request");
+				if let Proto::Request(url, rq, sender, redir) = item {
+					trace!(target: "fetch", "new request to {}", url);
 					let timeout = match reactor::Timeout::new(maxdur, &handle) {
 						Ok(t)  => t,
 						Err(e) => {
@@ -176,17 +177,18 @@ impl Client {
 					};
 					let reschedule = tx_proto.clone();
 					let future = client.request(rq).select2(timeout).then(move |rs| {
-						trace!(target: "fetch", "request finished");
+						trace!(target: "fetch", "response received from {}", url);
 						// When sending responses back over the oneshot channels, we treat
 						// the possibility that the other end is gone as normal, hence we
 						// use `unwrap_or(())` and do not error.
 						match rs {
 							Ok(Either::A((rs, _))) => {
-								if let Some(url) = redirect_location(&rs) {
+								if let Some(next_url) = redirect_location(url, &rs) {
 									if redir == 0 {
 										Either::A(future::ok(sender.send(Err(Error::TooManyRedirects)).unwrap_or(())))
 									} else {
-										Either::B(reschedule.send(Proto::Request(get(url), sender, redir - 1)).then(|result| {
+										let next_req = get(&next_url);
+										Either::B(reschedule.send(Proto::Request(next_url, next_req, sender, redir - 1)).then(|result| {
 											if let Err(e) = result {
 												error!(target: "fetch", "failed to reschedule request: {}", e);
 											}
@@ -250,30 +252,29 @@ impl Fetch for Client {
 	fn fetch_with_abort(&self, url: &str, abort: Abort) -> Self::Result {
 		debug!(target: "fetch", "fetching: {:?}", url);
 
-		let url: Uri = match url.parse() {
+		let url: Url = match url.parse() {
 			Ok(u)  => u,
 			Err(e) => return Box::new(futures::future::err(e.into()))
 		};
 
-		let req    = get(url.clone());
+		let req    = get(&url);
 		let sender = self.tx_proto.clone();
 		let limit  = self.limit.clone();
-		let future = self.pool.spawn_fn(move || {
-			let (tx_res, rx_res) = oneshot::channel();
-			sender.send(Proto::Request(req, tx_res, MAX_REDIRECTS)).map(|_| rx_res)
-		})
-		.map_err(|e| {
-			error!(target: "fetch", "failed to schedule request: {}", e);
-			Error::Other("failed to schedule request".into())
-		})
-		.and_then(move |rx_res| {
-			FetchTask {
-				url: url,
-				rx_res: rx_res,
-				limit: limit,
-				abort: abort
-			}
-		});
+		let (tx_res, rx_res) = oneshot::channel();
+		let future = sender.send(Proto::Request(url.clone(), req, tx_res, MAX_REDIRECTS))
+			.map(|_| rx_res)
+			.map_err(|e| {
+				error!(target: "fetch", "failed to schedule request: {}", e);
+				Error::Other("failed to schedule request".into())
+			})
+			.and_then(move |rx_res| {
+				FetchTask {
+					url: url,
+					rx_res: rx_res,
+					limit: limit,
+					abort: abort
+				}
+			});
 		Box::new(future)
 	}
 
@@ -294,33 +295,33 @@ impl Fetch for Client {
 	}
 }
 
-fn redirect_location(r: &hyper::Response) -> Option<Uri> {
+fn redirect_location(u: Url, r: &hyper::Response) -> Option<Url> {
 	use hyper::StatusCode::*;
 	match r.status() {
 		MovedPermanently
-            | PermanentRedirect
-            | TemporaryRedirect
-            | Found
-            | SeeOther =>
-        {
+		| PermanentRedirect
+		| TemporaryRedirect
+		| Found
+		| SeeOther => {
 			if let Some(loc) = r.headers().get::<Location>() {
-				loc.parse().ok()
+				u.join(loc).ok()
 			} else {
 				None
 			}
-        }
+		}
 		_ => None
 	}
 }
 
-fn get(u: Uri) -> hyper::Request {
-	let mut rq = Request::new(Method::Get, u);
+fn get(u: &Url) -> hyper::Request {
+    let uri = u.as_ref().parse().expect("Every valid URL is aso a URI");
+	let mut rq = Request::new(Method::Get, uri);
 	rq.headers_mut().set(UserAgent::new("Parity Fetch Neo"));
 	rq
 }
 
 struct FetchTask {
-	url:    Uri,
+	url:    Url,
 	rx_res: RxResponse,
 	limit:  Option<usize>,
 	abort:  Abort
@@ -358,8 +359,8 @@ pub enum Error {
 	Hyper(hyper::Error),
 	/// I/O error
 	Io(io::Error),
-	/// URI parse error
-	Uri(hyper::error::UriError),
+	/// URL parse error
+	Url(url::ParseError),
 	/// Request aborted
 	Aborted,
 	/// Followed too many redirects
@@ -377,7 +378,7 @@ impl fmt::Display for Error {
 		match *self {
 			Error::Aborted          => write!(fmt, "The request has been aborted."),
 			Error::Hyper(ref e)     => write!(fmt, "{}", e),
-			Error::Uri(ref e)       => write!(fmt, "{}", e),
+			Error::Url(ref e)       => write!(fmt, "{}", e),
 			Error::Io(ref e)        => write!(fmt, "{}", e),
 			Error::Other(ref e)     => write!(fmt, "{}", e),
 			Error::TooManyRedirects => write!(fmt, "too many redirects"),
@@ -405,9 +406,9 @@ impl From<io::Error> for Error {
 	}
 }
 
-impl From<hyper::error::UriError> for Error {
-	fn from(e: hyper::error::UriError) -> Self {
-		Error::Uri(e)
+impl From<url::ParseError> for Error {
+	fn from(e: url::ParseError) -> Self {
+		Error::Url(e)
 	}
 }
 
@@ -597,6 +598,13 @@ mod test {
 	fn it_should_follow_redirects() {
 		let client = Client::new().unwrap();
 		let future = client.fetch("https://httpbin.org/absolute-redirect/3");
+		assert!(future.wait().unwrap().is_success())
+	}
+
+	#[test]
+	fn it_should_follow_relative_redirects() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/relative-redirect/3");
 		assert!(future.wait().unwrap().is_success())
 	}
 
