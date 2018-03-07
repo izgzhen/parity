@@ -297,12 +297,18 @@ impl Fetch for Client {
 fn redirect_location(r: &hyper::Response) -> Option<Uri> {
 	use hyper::StatusCode::*;
 	match r.status() {
-		MovedPermanently | PermanentRedirect | TemporaryRedirect =>
+		MovedPermanently
+            | PermanentRedirect
+            | TemporaryRedirect
+            | Found
+            | SeeOther =>
+        {
 			if let Some(loc) = r.headers().get::<Location>() {
 				loc.parse().ok()
 			} else {
 				None
-			},
+			}
+        }
 		_ => None
 	}
 }
@@ -568,19 +574,61 @@ mod test {
 
 	#[test]
 	fn it_should_fetch() {
-		let fetch = Client::new().unwrap();
-		let future_resp1 = fetch.fetch("https://wikipedia.org"); // redirects
-		let future_resp2 = fetch.fetch("https://github.com");
-		let mut resp1 = future_resp1.wait().unwrap();
-		let mut resp2 = future_resp2.wait().unwrap();
-		assert!(resp1.is_success());
-		assert!(resp2.is_success());
-		let mut s = String::new();
-		resp1.read_to_string(&mut s).unwrap();
-		println!("{} bytes", s.len());
-		s.clear();
-		resp2.read_to_string(&mut s).unwrap();
-		println!("{} bytes", s.len());
-		fetch.close().unwrap()
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/drip?numbytes=3&duration=3&delay=1&code=200");
+		let mut resp = future.wait().unwrap();
+		assert!(resp.is_success());
+		let mut body = Vec::new();
+		resp.read_to_end(&mut body).unwrap();
+		assert_eq!(body.len(), 3)
+	}
+
+	#[test]
+	fn it_should_timeout() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/delay/7");
+		match future.wait() {
+			Err(Error::Timeout) => {}
+			other => panic!("expected timeout, got {:?}", other)
+		}
+	}
+
+	#[test]
+	fn it_should_follow_redirects() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/absolute-redirect/3");
+		assert!(future.wait().unwrap().is_success())
+	}
+
+	#[test]
+	fn it_should_not_follow_too_many_redirects() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/absolute-redirect/100");
+		match future.wait() {
+			Err(Error::TooManyRedirects) => {}
+			other => panic!("expected too many redirects error, got {:?}", other)
+		}
+	}
+
+	#[test]
+	fn it_should_read_data() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/bytes/1024");
+		let mut resp = future.wait().unwrap();
+		assert!(resp.is_success());
+		let mut body = Vec::new();
+		resp.read_to_end(&mut body).unwrap();
+		assert_eq!(body.len(), 1024)
+	}
+
+	#[test]
+	fn it_should_read_chunked_data() {
+		let client = Client::new().unwrap();
+		let future = client.fetch("https://httpbin.org/stream-bytes/1024?chunk_size=19");
+		let mut resp = future.wait().unwrap();
+		assert!(resp.is_success());
+		let mut body = Vec::new();
+		resp.read_to_end(&mut body).unwrap();
+		assert_eq!(body.len(), 1024)
 	}
 }
